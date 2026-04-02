@@ -1,137 +1,71 @@
-import timm
+import argparse
+import json
+
 import torch
-import torch.nn as nn
-from timm.models.pvt_v2 import PyramidVisionTransformerStage
+from PIL import Image
+from torchvision import transforms
+
+from model import DualBranchCoAtNetPVTv2Classifier
 
 
-def get_best_coatnet_name() -> str:
-    coatnet_candidates = [
-        "coatnet_0_rw_224.sw_in1k",
-        "coatnet_0_rw_224",
-        "coatnet_1_rw_224.sw_in1k",
-        "coatnet_1_rw_224",
-        "coatnet_2_rw_224.sw_in12k_ft_in1k",
-        "coatnet_2_rw_224",
-    ]
-    available = set(timm.list_models())
-    for name in coatnet_candidates:
-        if name in available:
-            return name
-    raise ValueError("No supported CoAtNet model found in this timm install.")
+CLASS_NAMES = ["fake", "real"]  # change if your label order differs
 
 
-def choose_num_heads(channels: int) -> int:
-    for h in [24, 16, 12, 8, 6, 4, 2]:
-        if channels % h == 0:
-            return h
-    return 1
+def build_transform(img_size: int):
+    return transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
 
 
-class SingleBranch(nn.Module):
-    def __init__(self, coatnet_name: str, activation_type: str, dropout: float = 0.4, elu_alpha: float = 1.0):
-        super().__init__()
-
-        self.cnn = timm.create_model(
-            coatnet_name,
-            pretrained=True,
-            features_only=True,
-            out_indices=(3,),
-        )
-
-        channels = self.cnn.feature_info.channels()[-1]
-        num_heads = choose_num_heads(channels)
-
-        self.pvt_stage = PyramidVisionTransformerStage(
-            dim=channels,
-            dim_out=channels,
-            depth=1,
-            downsample=False,
-            num_heads=num_heads,
-            sr_ratio=1,
-            linear_attn=False,
-            mlp_ratio=4.0,
-            qkv_bias=True,
-            proj_drop=0.0,
-            attn_drop=0.0,
-            drop_path=0.1,
-            norm_layer=nn.LayerNorm,
-        )
-
-        self.pool = nn.AdaptiveAvgPool2d(1)
-
-        if activation_type.lower() == "gelu":
-            self.activation = nn.GELU()
-            head_act = nn.GELU()
-        elif activation_type.lower() == "elu":
-            self.activation = nn.ELU(alpha=elu_alpha)
-            head_act = nn.ELU(alpha=elu_alpha)
-        else:
-            raise ValueError("activation_type must be 'gelu' or 'elu'")
-
-        self.head = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(channels, 128),
-            head_act,
-            nn.Dropout(dropout),
-        )
-
-        self.out_dim = 128
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feat = self.cnn(x)[0]           # [B, C, H, W]
-        feat = feat.permute(0, 2, 3, 1) # [B, H, W, C]
-        feat = self.pvt_stage(feat)     # [B, C, H, W]
-        feat = self.activation(feat)
-        feat = self.pool(feat).flatten(1)
-        feat = self.head(feat)
-        return feat
+def load_model(checkpoint_path: str, device: torch.device, dropout: float, elu_alpha: float):
+    model = DualBranchCoAtNetPVTv2Classifier(
+        dropout=dropout,
+        elu_alpha=elu_alpha,
+    )
+    state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+    return model
 
 
-class DualBranchCoAtNetPVTv2Classifier(nn.Module):
-    def __init__(self, dropout: float = 0.4, elu_alpha: float = 1.0):
-        super().__init__()
+@torch.no_grad()
+def predict_image(model, image_path: str, device: torch.device, img_size: int):
+    image = Image.open(image_path).convert("RGB")
+    tensor = build_transform(img_size)(image).unsqueeze(0).to(device)
 
-        coatnet_name = get_best_coatnet_name()
+    logits = model(tensor)
+    probs = torch.softmax(logits, dim=1)[0].cpu()
 
-        self.gelu_branch = SingleBranch(
-            coatnet_name=coatnet_name,
-            activation_type="gelu",
-            dropout=dropout,
-            elu_alpha=elu_alpha,
-        )
-        self.elu_branch = SingleBranch(
-            coatnet_name=coatnet_name,
-            activation_type="elu",
-            dropout=dropout,
-            elu_alpha=elu_alpha,
-        )
+    pred_idx = int(torch.argmax(probs).item())
+    confidence = float(probs[pred_idx].item())
 
-        self.gelu_norm = nn.LayerNorm(self.gelu_branch.out_dim)
-        self.elu_norm = nn.LayerNorm(self.elu_branch.out_dim)
+    return {
+        "predicted_class": CLASS_NAMES[pred_idx],
+        "confidence": confidence,
+        "probabilities": {
+            CLASS_NAMES[i]: float(probs[i].item()) for i in range(len(CLASS_NAMES))
+        },
+    }
 
-        self.gelu_weight = nn.Parameter(torch.tensor(1.0))
-        self.elu_weight = nn.Parameter(torch.tensor(1.0))
 
-        fused_dim = self.gelu_branch.out_dim + self.elu_branch.out_dim
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image", type=str, required=True)
+    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--img_size", type=int, default=224)
+    parser.add_argument("--dropout", type=float, default=0.4)
+    parser.add_argument("--elu_alpha", type=float, default=1.0)
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
 
-        self.classifier = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(fused_dim, 64),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 2),
-        )
+    device = torch.device(args.device)
+    model = load_model(args.checkpoint, device, args.dropout, args.elu_alpha)
+    result = predict_image(model, args.image, device, args.img_size)
+    print(json.dumps(result, indent=2))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gelu_feat = self.gelu_branch(x)
-        elu_feat = self.elu_branch(x)
 
-        gelu_feat = self.gelu_norm(gelu_feat)
-        elu_feat = self.elu_norm(elu_feat)
-
-        gelu_feat = self.gelu_weight * gelu_feat
-        elu_feat = self.elu_weight * elu_feat
-
-        fused = torch.cat([gelu_feat, elu_feat], dim=1)
-        logits = self.classifier(fused)
-        return logits
+if __name__ == "__main__":
+    main()

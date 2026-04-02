@@ -1,71 +1,98 @@
-import argparse
-import json
+# Hybrid Deepfake Detector
 
-import torch
-from PIL import Image
-from torchvision import transforms
+A dual-branch deepfake image classifier built with PyTorch and timm.
 
-from model import DualBranchCoAtNetPVTv2Classifier
+## Architecture
 
+Input image is processed by two parallel branches:
 
-CLASS_NAMES = ["fake", "real"]  # change if your label order differs
+- Branch 1: CoAtNet -> PVTv2Stage -> GELU
+- Branch 2: CoAtNet -> PVTv2Stage -> ELU
 
+The two branch features are:
+- normalized with LayerNorm
+- scaled by learnable branch weights
+- concatenated
+- passed through a classifier head
 
-def build_transform(img_size: int):
-    return transforms.Compose([
-        transforms.Resize((img_size, img_size)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-    ])
+## Repo structure
 
+```text
+hybrid-deepfake-detector/
+├── model.py
+├── train.py
+├── predict.py
+├── requirements.txt
+├── README.md
+└── checkpoints/
+```
 
-def load_model(checkpoint_path: str, device: torch.device, dropout: float, elu_alpha: float):
-    model = DualBranchCoAtNetPVTv2Classifier(
-        dropout=dropout,
-        elu_alpha=elu_alpha,
-    )
-    state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    model.load_state_dict(state_dict)
-    model.to(device)
-    model.eval()
-    return model
+## Installation
 
+```bash
+pip install -r requirements.txt
+```
 
-@torch.no_grad()
-def predict_image(model, image_path: str, device: torch.device, img_size: int):
-    image = Image.open(image_path).convert("RGB")
-    tensor = build_transform(img_size)(image).unsqueeze(0).to(device)
+## Dataset format
 
-    logits = model(tensor)
-    probs = torch.softmax(logits, dim=1)[0].cpu()
+The dataset should follow ImageFolder format:
 
-    pred_idx = int(torch.argmax(probs).item())
-    confidence = float(probs[pred_idx].item())
+```text
+data/
+├── fake/
+│   ├── img1.jpg
+│   ├── img2.jpg
+│   └── ...
+└── real/
+    ├── img1.jpg
+    ├── img2.jpg
+    └── ...
+```
 
-    return {
-        "predicted_class": CLASS_NAMES[pred_idx],
-        "confidence": confidence,
-        "probabilities": {
-            CLASS_NAMES[i]: float(probs[i].item()) for i in range(len(CLASS_NAMES))
-        },
-    }
+## Training
 
+Example:
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--image", type=str, required=True)
-    parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--img_size", type=int, default=224)
-    parser.add_argument("--dropout", type=float, default=0.4)
-    parser.add_argument("--elu_alpha", type=float, default=1.0)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    args = parser.parse_args()
+```bash
+python train.py \
+  --data_dir /path/to/data \
+  --save_dir checkpoints \
+  --save_name best_model.pth \
+  --img_size 224 \
+  --batch_size 8 \
+  --epochs 8 \
+  --warmup_epochs 3 \
+  --lr 1e-5 \
+  --dropout 0.4
+```
 
-    device = torch.device(args.device)
-    model = load_model(args.checkpoint, device, args.dropout, args.elu_alpha)
-    result = predict_image(model, args.image, device, args.img_size)
-    print(json.dumps(result, indent=2))
+## Inference
 
+Example:
 
-if __name__ == "__main__":
-    main()
+```bash
+python predict.py \
+  --image /path/to/test.jpg \
+  --checkpoint checkpoints/best_model.pth
+```
+
+## Output format
+
+Example:
+
+```json
+{
+  "predicted_class": "fake",
+  "confidence": 0.9132,
+  "probabilities": {
+    "fake": 0.9132,
+    "real": 0.0868
+  }
+}
+```
+
+## Notes
+
+- If your label order is different, update `CLASS_NAMES` in `predict.py`.
+- If GPU memory is limited, reduce `--batch_size`.
+- The best checkpoint is chosen by validation ROC-AUC.
